@@ -1,0 +1,498 @@
+---
+title: "MR Data Challenge 2019 Report"
+output:
+  html_document:
+    fig_width: 8 
+bibliography: MRDataChallenge2019-submission.bib
+link-citations: yes
+---
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+setwd("~/Dropbox/MR_Bayes/MRDataChallenge2019-sub")
+
+# load libraries
+library(Rcpp)
+library(RcppArmadillo)
+library(RcppDist)
+library(mr.raps)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(reshape2)
+library(rsnps)
+
+library(devtools)
+install_github("danieliong/MR.MCEM", quiet = TRUE)
+library(MR.MCEM)
+
+# load data 
+load("Data/MRDataChallenge2019_qz.rda")
+
+data <- as.data.frame(combined.data[, c("SNP", "pval_hdl_teslovich",
+                          "beta_hdl_c_kettunen", "se_hdl_c_kettunen",
+                          "beta_cad", "se_cad")])
+names(data) <- c("SNP", "pval.selection",
+                 "beta.exposure", "se.exposure",
+                 "beta.outcome", "se.outcome")
+data <- subset(data, pval.selection < 5e-8)
+
+data$beta.outcome <- data$beta.outcome * sign(data$beta.exposure)
+data$beta.exposure <- abs(data$beta.exposure)
+
+X <- data[,"beta.exposure"]
+Y <- data[,"beta.outcome"]
+seX <- data[,"se.exposure"]
+seY <- data[,"se.outcome"]
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+# set initial values
+K <- 2
+init_m_X <- mean(X)
+init_lambdaX <- sd(X)
+initPis <- rep(1/K, K)
+initMus <- c(-0.5, 0.15)
+initSds <- rep(0.15,K)
+initTau <- 1
+initVals <- list("pis" = initPis, "mus" = initMus, "sds" = initSds,
+                 "m_X" = init_m_X, "lambdaX" = init_lambdaX, "tau" = initTau)
+
+# set algorithm parameters
+M <- 5 # determines rate at which MC sample size increases with each iteration
+max_Nsamples <- 1e6 # max. MC sample size
+max_iters <- 100 # max. number of iterations
+Nstart_MC <- 300 # starting MC sample size
+eps <- 1e-2 # threshold for determining convergence
+alpha <- 0.10
+gamma <- 0.10
+prior_shape <- 1
+prior_scale <- (0.10)^2 * (prior_shape + 1)
+
+invGammaPrior <-FALSE
+equalSds <- FALSE
+overDispersedY <- FALSE
+verbose <- FALSE
+
+MCEM_fit <- MR_EM(K, initVals, Nstart_MC, X, Y,
+                  seX, seY, overDispersedY = overDispersedY, equalSds = equalSds, invGammaPrior = invGammaPrior, prior_shape = prior_shape,
+                  prior_scale = prior_scale, M = M, max_Nsamples = max_Nsamples, max_iters = max_iters,
+                  eps=eps, verbose = verbose)
+```
+
+# Participants 
+
+* Daniel Iong (University of Michigan Department of Statistics) daniong@umich.edu
+
+* Qingyuan Zhao (University of Pennsylvania Department of Statistics) qyzhao@wharton.upenn.edu
+
+
+# Motivation 
+
+HDL are heterogeneous subpopulations of discrete particles that differ in apolipoprotein and lipid composition. Previous Mendelian randomization (MR) studies reported heterogeneous associations between genetically determined HDL cholesterol (HDL-C) and coronary artery disease (CAD) [@voight2012plasma;@Zhao2018]. Our research questions are:
+
+1. Which groups of genetic instruments yield similiar causal effect estimates of HDL-C on risk for CAD? 
+2. Can these groups be linked to distinct biological mechanisms using GWAS data for the lipoprotein subfractions?
+
+# Data
+
+We constructed a dataset using the GWAS summary data published by GLGC, CARDIoGRAMplusC4D and @kettunen2016genome. We used the GWAS results in [@Teslovich2010] to select independent instruments that are associated with HDL-C (p-value $\leq 5e^{-8}$) and then obtained the estimated associations of the SNPs with HDL-C, CAD and lipoprotein subfractions using the GWAS results of @kettunen2016genome and @Nikpay2015. The table below summarizes how the data were obtained.
+
+ Purpose                       Phenotype                  Data source/Citation          
+------------------------------ -------------------------- ---------------------
+Instrument selection           HDL                        GLGC [@Teslovich2010]     
+SNP association with exposure  HDL                        @kettunen2016genome
+SNP association with outcomee  CAD                        CARDIoGRAMplusC4D [@Nikpay2015]
+Explore heterogeneity          Lipoprotein subfractions   @kettunen2016genome
+
+# Analysis methods
+
+## Model Assumptions
+
+For the first research question, we introduced a mixture model to account for effect heterogeneity of the instruments. This model has several components:
+
+1. **Measurement error**: SNP-exposure effects and SNP-outcome effects are observed with (known) measurement error with unknown means.
+
+2. **Independence**: All the estimated SNP associations are mutually independent. The independence between the SNP-exposure and SNP-outcome effect for a given SNP is guaranteed if they are computed using non-overlapping samples. Independence across SNPs is a reasonable assumption if the selected SNPs are in linkage equilibrium. 
+
+3. **Effect heterogeneity**: We assume each instrument may estimate a different "causal" effect and the instrument-specific effects follow a Gaussian mixture distribution.
+
+Assumptions 1 & 2 are standard in MR analysis, see for example @Zhao2018. Assumption 3 differs from the standard MR assumption and the mixture distribution captures the idea that instruments on the same genetic pathway may correspond to similar causal effect estimates. Small and balanced horizontal pleiotropy is captured by the within-cluster variation.
+
+## Statistical methods
+
+1. **Visual inspection of effect heterogeneity**: We first use a modal plot developed in Wang et al.\ (forthcoming, implemented in the *modal.plot* function from the *mr.raps* package) to visualize the data. This plot shows a robustified log-likelihood function over the causal effect and will exhibit multiple modes when there are clustered effect heterogeneity. Visual inspection of the scatterplot between estimated SNP-exposure and SNP-outcome effects can also suggest heterogeneity among variant-specific estimates. 
+
+2. **Bayesian inference for the mixture model**: We used a Monte-Carlo EM algorithm to estimate the prior parameters in the mixture model and then obtained (empirical Bayes) posterior distribution of the instrument-specific effects. See the Technical Appendix below for more detail.
+
+3. **Examine heatmap of lipoprotein subfractions**: We ranked the variants based on the posterior mean of their instrument-specific effects and plot a heatmap of the associations of the SNPs with lipoprotein subfractions. This heatmap may provide some insights if groups of SNPs with similar instrument-specific effects correspond to distinct biological mechanisms.
+
+
+# Results
+
+```{r, echo=FALSE}
+fitted.pis <- as.numeric(MCEM_fit$pis)
+fitted.mus <- as.numeric(MCEM_fit$mus)
+fitted.sds <- as.numeric(MCEM_fit$sds)
+
+# sample from posterior given the above estimates 
+post_impt_samples <- sampleLatentVarPost(100000, X, Y, seX, seY, MCEM_fit)
+W <- post_impt_samples$W
+rowSumW <- rowSums(W)
+muX_samps <- post_impt_samples$muX_samps
+beta_samps <- post_impt_samples$beta_samps
+prob_samps <- post_impt_samples$alpha_samps
+
+beta_est <- rowSums(W * beta_samps) / rowSumW
+
+beta_resamps <- matrix(NA, nrow = nrow(beta_samps), ncol = ncol(beta_samps))
+for (i in 1:nrow(data)) {
+  beta_resamps[i,] <- sample(beta_samps[i,], ncol(beta_resamps), prob = (W[i,]/rowSumW[i]), replace=TRUE)
+}
+rownames(beta_resamps) <- data$SNP
+
+ordered.SNPs <- as.character(data$SNP[order(beta_est)])
+
+beta_q50 <- apply(beta_resamps, 1, quantile, probs = 0.5)
+# ordered.SNPs <- as.character(data$SNP[order(beta_q50)])
+beta_q50 <- beta_q50[ordered.SNPs]
+
+beta_resamps <- beta_resamps[ordered.SNPs,]
+beta_q5 <- apply(beta_resamps, 1, quantile, probs = 0.05)
+beta_q95 <- apply(beta_resamps, 1, quantile, probs = 0.95)
+
+prob_est <- matrix(NA, nrow = nrow(data), ncol = K)
+for (k in 1:K) {
+  prob_est[,k] <- rowSums(W * prob_samps[,,k]) / rowSumW
+}
+colnames(prob_est) <- c("p1", "p2")
+
+comp_assignments <- apply(prob_est,1,which.max)
+names(comp_assignments) <- data$SNP
+
+data <- cbind(data, round(prob_est,2))
+
+# data$beta.outcome <- data$beta.outcome * sign(data$beta.exposure)
+# data$beta.exposure <- abs(data$beta.exposure)
+```
+
+
+We fit our model with 2 mixture components to the data discussed above and provide interactive visualizations for the model output. We chose 2 mixture components because there appears to be 2 modes in the modal plot from **mr.raps** (plotted below). 
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+modal.plot(data = data, k = 1.5)
+```
+
+
+In the scatterplot below, the slopes of the colored solid lines are the estimated cluster means and the shaded region is the associated 68% confidence interval. Hovering over the points displays the RSID of the SNP and posterior probabilities of belonging to each cluster. The points are colored to match the cluster that it has the highest probability of belonging to. Furthermore, hovering over the solid lines will display the mixture component parameters. 
+
+The second plot displays the 95\% posterior interval of the "causal" effect for each SNP. Hovering over the intervals will display additional information about the SNP (chromosome, gene, BP). The third plot is a heatmap of the p-values between the SNPs and lipoprotein subfraction traits. Negative associations are colored in red. Hovering over each box will display the SNP, trait, and p-value. One can also zoom in and isolate specific portions by dragging a box across the heatmap. These plots were created using the **plotly** R package. 
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, cache=TRUE, eval = TRUE, fig.height=6}
+colors <- c("dodgerblue1", "purple3")
+
+p <- ggplot(data = data, aes(x = beta.exposure, y = beta.outcome,
+        xmin = beta.exposure - se.exposure, xmax = beta.exposure +
+            se.exposure, ymin = beta.outcome - se.outcome, ymax = beta.outcome +
+            se.outcome)) + geom_point(size = 1, shape = 1, color = colors[comp_assignments],
+                                      aes(text = paste("SNP:", SNP,"<br> Prob 1:", p1,
+                                                       "<br> Prob 2:", p2))) +
+        geom_errorbar(alpha = 0.3, width = 0, color = colors[comp_assignments]) +
+        geom_errorbarh(alpha = 0.3, height = 0, color = colors[comp_assignments]) +
+        expand_limits(x = 0, y = 0) + xlab(paste("SNP effect on exposure")) +
+        ylab(paste("SNP effect on outcome")) + theme_classic(base_size = 15) +
+        geom_hline(yintercept = 0, linetype = "dotted", alpha = 0.4) +
+        geom_vline(xintercept = 0, linetype = "dotted", alpha = 0.4)
+p <- ggplotly(p, tooltip = c("text"))
+# p <- layout(p, showlegend=TRUE)
+
+
+for (k in 1:K) {
+  x <- seq(0, .16, .001)
+  y <- fitted.mus[k] * x
+  ymin <- (fitted.mus[k]-fitted.sds[k]) * x
+  ymax <- (fitted.mus[k]+fitted.sds[k]) * x
+  plot.dat <- data.frame(k = k, x = x, y = y, ymin = ymin, ymax = ymax)
+  plot.dat$k <- as.factor(plot.dat$k)
+  hovertxt.lines <- paste("Mixture",k,"<br> Mixture proportion:",round(fitted.pis[k],2), "<br> Mean:",round(fitted.mus[k],3),
+                          "<br> SD:",round(fitted.sds[k],2))
+  p <- add_lines(p, x = ~x, y = ~y, color = ~k, colors = colors, text = hovertxt.lines, hoverinfo = "text", data = plot.dat, inherit = TRUE)
+  p <- add_ribbons(p, x = ~x, ymin = ~ymin, ymax = ~ymax, color = ~k, colors = colors, hoverinfo = "none", opacity = fitted.pis[k], data = plot.dat)
+}
+
+
+############### ggplot version #################
+# p_build <- ggplot_build(p)
+# for (k in 1:K) {
+#   x <- seq(0, p_build$layout$panel_params[[1]]$x.range[2], .001)
+#   y <- fitted.mus[k] * x
+#   ymin <- (fitted.mus[k]-fitted.sds[k]) * x
+#   ymax <- (fitted.mus[k]+fitted.sds[k]) * x
+#   ribbon.dat <- data.frame(x = x, y = y, ymin = ymin, ymax = ymax)
+#   p <- p + geom_abline(intercept = 0, slope = fitted.mus[k], color = colors[k], aes(text = "test")) + geom_ribbon(data = ribbon.dat,
+#                                                                                       aes(x = x, ymin = ymin, ymax = ymax), alpha = 0.6*fitted.pis[k], fill = colors[k], inherit.aes = FALSE) + geom_abline(intercept = 0, slope = fitted.mus[k]-fitted.sds[k], color = colors[k], alpha = 0.2) + geom_abline(intercept = 0, slope = fitted.mus[k]+fitted.sds[k], color = colors[k], alpha = 0.2)
+# }
+#######################################################
+
+p
+```
+
+
+<!--
+```{r, echo = FALSE, warning=FALSE, message=FALSE, cache = TRUE, eval = FALSE}
+################### Violin Plots #############################
+# HTML output for this is too large so I don't display it
+
+Z <- sample(1:K, ncol(beta_resamps), replace = TRUE, prob = fitted.pis)
+prior.samps <- rnorm(ncol(beta_resamps), fitted.mus[Z], fitted.sds[Z])
+
+mixture.samps <- matrix(NA, nrow = K, ncol = ncol(beta_resamps))
+
+for (k in 1:K) {
+  mixture.samps[k,] <- rnorm(ncol(beta_resamps), fitted.mus[k], fitted.sds[k])
+}
+rownames(mixture.samps) <- sapply(1:K, function(k) paste("Mix",k,sep=""))
+
+violin.data <- rbind(Prior = prior.samps, mixture.samps, beta_resamps)
+
+library(reshape2)
+violin.data_melted <- melt(violin.data)
+violin.plots <- plot_ly(data = violin.data_melted, x = ~Var1, y = ~value, split = ~Var1, type = "violin",
+        box = list(visible = TRUE),
+        meanline = list(visible = TRUE),
+        hoverinfo = "text", 
+        visible = "legendonly") %>% layout(title = "Violin Plots of Posterior Distr. for each SNP", yaxis = list(title = "", zeroline = TRUE), xaxis = list(title = ""))
+violin.plots
+```
+-->
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.height = 10.75}
+library(magrittr)
+library(tibble)
+library(stringr)
+
+combined.data <- as.data.frame(combined.data)
+
+ref_allele <- "hdl_c"
+beta.mtx <- combined.data %>% 
+  tibble::column_to_rownames("SNP") %>%
+  dplyr::select(starts_with("beta")) %>% 
+  dplyr::select(ends_with("kettunen")) %>% 
+  rename_all(funs(str_replace(.,"beta_",""))) %>% 
+  rename_all(funs(str_replace(.,"_kettunen","")))
+beta.mtx <- beta.mtx * sign(beta.mtx[,ref_allele])
+
+pval.mtx <- combined.data %>% 
+  column_to_rownames("SNP") %>%
+  dplyr::select(starts_with("pval")) %>% 
+  dplyr::select(ends_with("kettunen")) %>% 
+  rename_all(list(~str_replace(.,"pval_",""))) %>% 
+  rename_all(list(~str_replace(.,"_kettunen",""))) %>%
+  log10(.) %>% multiply_by(-as.matrix(sign(beta.mtx)))
+
+beta.mtx <- beta.mtx[ordered.SNPs,]
+pval.mtx <- pval.mtx[ordered.SNPs,]
+
+beta.mtx_melted <- melt(as.matrix(beta.mtx))
+
+pval.mtx_melted <- melt(as.matrix(pval.mtx))
+
+traits <- c(
+    "vldl_d",
+    "xxl_vldl_l", "xxl_vldl_p", "xxl_vldl_pl", "xxl_vldl_tg",
+    "xl_vldl_l", "xl_vldl_p", "xl_vldl_pl", "xl_vldl_tg",
+    "l_vldl_c", "l_vldl_ce", "l_vldl_fc", "l_vldl_l", "l_vldl_p", "l_vldl_pl", "l_vldl_tg",
+    "m_vldl_c", "m_vldl_ce", "m_vldl_fc", "m_vldl_l", "m_vldl_p", "m_vldl_pl", "m_vldl_tg",
+    "s_vldl_fc", "s_vldl_l", "s_vldl_p", "s_vldl_pl", "s_vldl_tg",
+    "xs_vldl_l", "xs_vldl_p", "xs_vldl_pl", "xs_vldl_tg",
+    "apob", "ldl_c", "ldl_d",
+    "l_ldl_c", "l_ldl_ce", "l_ldl_fc", "l_ldl_l", "l_ldl_p", "l_ldl_pl",
+    "m_ldl_c", "m_ldl_ce", "m_ldl_l", "m_ldl_p", "m_ldl_pl",
+    "s_ldl_c", "s_ldl_l", "s_ldl_p",
+    "idl_c", "idl_fc", "idl_l", "idl_p", "idl_pl", "idl_tg",
+    "apoa1", "hdl_c", "hdl_d",
+    "l_hdl_c",
+    "xl_hdl_c", "xl_hdl_ce", "xl_hdl_fc", "xl_hdl_l", "xl_hdl_p", "xl_hdl_pl", "xl_hdl_tg",
+    "l_hdl_ce", "l_hdl_fc", "l_hdl_l", "l_hdl_p", "l_hdl_pl",
+    "m_hdl_c", "m_hdl_ce", "m_hdl_fc","m_hdl_l", "m_hdl_p", "m_hdl_pl",
+    "s_hdl_l", "s_hdl_p", "s_hdl_tg")
+pval.mtx_melted$Var2 <- factor(pval.mtx_melted$Var2, rev(traits))
+
+pval.mtx_melted$pval <- signif(10^(-pval.mtx_melted$value *sign(beta.mtx_melted$value)),1)
+
+pval_q1 <- quantile(as.matrix(pval.mtx), 0.01)
+pval_q50 <- quantile(as.matrix(pval.mtx), 0.50)
+pval_q99 <- quantile(as.matrix(pval.mtx), 0.99)
+
+LDL_rows <- colnames(pval.mtx)[grep("ldl", colnames(pval.mtx))]
+
+HDL_rows <- colnames(pval.mtx)[grep("hdl", colnames(pval.mtx))]
+
+col_colors <- c("green", "orange")
+type_ind <- ifelse(grepl("hdl", pval.mtx_melted$Var2), 1, 2) 
+
+
+pval.heatmap <- ggplot(pval.mtx_melted) + aes(x = Var1, y = Var2, fill = pmin(pmax(value, pval_q1), pval_q99), text = paste("SNP:",Var1,"<br> Trait:",Var2, "<br> p-val:", pval)) + geom_tile(color = "black") + scale_fill_gradient2(low="red", high="blue", midpoint = pval_q50) + theme_minimal() + theme(axis.text.x = element_text(angle = 90), legend.title = element_blank(), legend.position = "none") + xlab("") + ylab("")
+
+beta.post_interv <- data.frame(cbind(beta_q5, beta_q50, beta_q95))
+beta.post_interv$SNP <- factor(rownames(beta.post_interv), ordered.SNPs)
+
+load("Data/SNP_query.RData")
+
+beta.post_interv$chromosome <- SNP_query.df$Chromosome
+beta.post_interv$gene <- SNP_query.df$Gene
+beta.post_interv$BP <- SNP_query.df$BP
+
+beta.post_interv_plot <- ggplot(beta.post_interv) + aes(x = SNP, y = beta_q50, ymin = beta_q5, ymax = beta_q95, text = paste("SNP:",SNP, "<br> Chromosome:",chromosome, "<br> Gene:",gene, "<br> BP:",BP)) + geom_point(color = colors[comp_assignments[ordered.SNPs]], shape = 4) + geom_errorbar(color = colors[comp_assignments[ordered.SNPs]]) + xlab("") + ylab("") + theme_minimal() + theme(axis.text.x = element_blank()) + geom_hline(data = as.data.frame(fitted.mus), yintercept = fitted.mus, linetype = "dotted", color = colors, size = 0.2)
+
+# library(cowplot)
+# plot_grid(pval.heatmap, beta.post_interv_plot, ncol = 1, align = "v", rel_heights = c(4,1))
+
+pval.heatmap <- ggplotly(pval.heatmap, tooltip = c("text"))
+beta.post_interv_plot <- ggplotly(beta.post_interv_plot, tooltip = c("text"))
+
+subp <- subplot(beta.post_interv_plot, pval.heatmap, nrows = 2, heights = c(1/5, 4/5), shareX = TRUE)
+subp
+```
+
+
+### Conclusions
+
+* The 2 SNPs with the highest (posterior) probability of belonging to the 2nd cluster (rs1532085, rs588136) are both in chromosome 15 and are close to the LIPC gene. 
+
+* rs1532085, rs588136, and rs174546 (cluster 2) are positively associated with all of the large and extra-large HDL subfraction traits. (p-value $\leq 10^{-11}$). 
+
+* rs1532085, rs588136, and rs174546 are negatively associated with concentration of small HDL particles (p-value $\leq 10^{-3}$). rs1532085 and rs588136 are negatively associated with total lipids in small HDL (p-value $\leq 10^{-14}$). 
+
+* rs1532085, rs588136, and rs174546 are positively associated with LDL diameter (p-value $\leq 10^{-7}$).
+
+* rs14320985 and rs588136 are positively associated with all of the very small VLDL subfraction traits (p-value $\leq 10^{-14}$). rs174546 is positively associated with total lipids and phospholipids in very small VLDL (p-value $\leq 10^{-3}$). 
+
+* rs1532085, rs588136, and rs174546 are positively associated with all of the IDL subtraction traits (p-value $\leq 10^{-4}$). 
+
+
+# Technical Appendix 
+
+The specifications of the model we fit in our analysis is given below.
+
+For SNP $i = 1,\dots,p$, 
+
+$$
+\begin{align*}
+    \mu_{X_i} & \sim N(m_x, \lambda_x^2) \\
+    Z_i & \sim \text{Categorical}(\pi_1,\dots,\pi_K) \\
+    \beta_i | Z_i = k & \sim N(\mu_k, \sigma_k^2) \\
+    \begin{pmatrix} X_i \\ Y_i \end{pmatrix} | \beta_i, \mu_{X_i} & \sim N \Big( \begin{pmatrix} \mu_{X_i} \\ \beta_i \mu_{X_i} \end{pmatrix}, \begin{pmatrix} \sigma_{X_i}^2 & 0 \\ 0 & \sigma_{Y_i}^2 \end{pmatrix} \Big) 
+\end{align*}
+$$
+
+Variables       Type                                 Description
+-------------- ------------------------------------ --------------------------------
+$\mu_{X_i}$     Latent (continuous)                  True SNP-exposure effect
+$Z_i$           Latent (categorical)                 Mixture component assignment for SNP $i$
+$\beta_i$       Latent (continuous)                  True variant-specific causal effect 
+$m_x$           Estimated parameter (continuous)     
+$\lambda_x$     Estimated parameter (continuous)
+$\pi_k$         Estimated parameter (continuous)     Mixture component proportions
+$\mu_k$         Estimated parameter (continuous)     Mixture component means
+$\sigma_k$      Estimated parameter (continuous)     Mixture component standard deviations
+$X_i$           Observed (continuous)                Observed SNP-exposure effects
+$Y_i$           Observed (continuous)                Observed SNP-outcome effects
+$\sigma_{X_i}$  Known constant                       Standard errors for observed SNP-exposure effects
+$\sigma_{Y_i}$  Known constant                       Standard errors for observed SNP-outcome effects
+$K$             Fixed                                Number of mixture components
+
+Let $\theta = (m_x, \lambda_x, \{\pi_k, \mu_k, \sigma_k : k = 1,\dots,K\})$ denote the parameters we want to estimate. 
+
+### Model fitting Procedure
+
+1. Obtain Empirical Bayes estimates $\hat{\theta}$ of $\theta$ using a Monte-Carlo EM algorithm (details provided below).
+
+2. Sample from $P(\mu_{X_i}, \beta_i, Z_i | X_i, Y_i, \hat{\theta})$, the posterior distribution of the latent variables given $\hat{\theta}$ (details provided below).
+
+### Posterior Sampling
+
+We will use importance sampling [@Liu2004] to sample from $P(\mu_{X_i}, \beta_i, Z_i | X_i, Y_i, \theta)$. Let $\phi(\cdot ; \mu, \sigma^2)$ denote the Gaussian density with mean $\mu$ and variance $\sigma^2$. 
+
+First, we can re-write the latent variable posterior as 
+
+$$
+\begin{align*}
+    P(\beta_i, Z_i = k, \mu_{X_i} | X_i, Y_i, \theta) & = P(\mu_{X_i}| X_i, Y_i, \theta) P(\beta_i | \mu_{X_i}, Y_i, \theta) P(Z_i = k | \beta_i, \theta) \\
+    & = P(\mu_{X_i} | X_i, Y_i, \theta) \Big[ \sum_{k=1}^K \pi_k \phi(\beta_i; \tilde{\mu}_{ik}, \tilde{\sigma}_{ik}^2) \Big] \Big[ \frac{\pi_k \phi(\beta_i; \mu_k, \sigma_k^2)}{\sum_{j=1}^K \pi_j \phi(\beta_i; \mu_j, \sigma_j^2)} \Big] \\
+\end{align*}
+$$
+where 
+
+$$
+\begin{align*}
+  \tilde{\sigma}_{ik}^2 &= \Big(\frac{1}{\sigma_k^2} + \frac{\mu_{X_i}^2}{\sigma_{Y_i}^2}\Big)^{-1} \\
+  \tilde{\mu}_{ik} & = \tilde{\sigma}_{ik}^2 \Big( \frac{Y_i \mu_{X_i}}{\sigma_{Y_i}^2} + \frac{\mu_k}{\sigma_k^2} \Big)
+\end{align*}
+$$
+
+ Thus, we can sample from $P(\mu_{X_i} | X_i, Y_i, \theta)$ using a (importance) proposal distribution, then sequentially sample from $P(\beta_i | \mu_{X_i}, Y_i, \theta)$ and  $P(Z_i = k | \beta_i, \theta)$ directly, and weight the samples according to the importance weights.
+ 
+ 
+$$
+\begin{align*}
+  P(\mu_{X_i} | X_i, Y_i, \theta) & \propto P(\mu_{X_i} | X_i, \theta) P(Y_i | \mu_{X_i}, \theta) \\
+  & = \phi(\mu_{X_i}; \tilde{m}_{X_i},\tilde{\lambda}_{X_i}^2) \Big[ \sum_{k=1}^K \pi_k \phi(Y_i; \mu_{X_i}\mu_k, \mu_{X_i}^2 \sigma_k^2 + \sigma_{Y_i}^2) \Big] =: \pi(\mu_{X_i}) \\
+\end{align*}
+$$
+ 
+where
+
+$$
+\begin{align*}
+  \tilde{\lambda}_{X_i}^2 &= \Big(\frac{1}{\sigma_{X_i}^2} + \frac{1}{\lambda_x^2}\Big)^{-1} \\
+  \tilde{m}_{X_i} & = \tilde{\lambda}_{X_i}^2 \Big(\frac{X_i}{\sigma_{X_i}^2} + \frac{m_x}{\lambda_x^2}\Big)
+\end{align*}
+$$
+
+We chose to use $g(\mu_{X_i}) = P(\mu_{X_i} | X_i, \theta)$ as the proposal distribution with associated importance weights
+
+$$
+w_i = \frac{\pi(\mu_{X_i})}{g(\mu_{X_i})} = \sum_{k=1}^K \pi_k \phi(Y_i; \mu_{X_i}\mu_k, \mu_{X_i}^2 \sigma_k^2 + \sigma_{Y_i}^2)
+$$
+Since $\phi(Y_i; \mu_{X_i}\mu_k, \mu_{X_i}^2 \sigma_k^2 + \sigma_{Y_i}^2) \leq \frac{1}{\sqrt{2\pi \sigma_{Y_i}^2}}$, 
+$$
+0 \leq w_i \leq \frac{1}{\sqrt{2\pi \sigma_{Y_i}^2}}
+$$
+Therefore, the importance weights are bounded. 
+
+
+### Monte-Carlo EM Algorithm
+
+Briefly, the EM algorithm [@Dempster1977] is an iterative algorithm to compute maximum likelihood estimates in latent variable models that consists of two steps:
+
+* **E Step**: Compute the expectation of the complete-data log-likelihood with respect to the posterior distribution of the latent variables, given the parameter estimates from the previous iteration. 
+
+* **M Step**: Maximize the expectation computed in the E step with respect to the parameters. 
+
+In our model, the expectation in the E step does not have an analytical form so we resort to Monte-Carlo methods to approximate it [@Levine2001]. 
+
+The complete-data log-likelihood is given by 
+
+$$
+\begin{align*}
+l(\theta | \mathbf{X}, \mathbf{Y}, \{\beta_i\}, \{Z_i\}, \{\mu_{X_i}\})  & :=  \sum_{i=1}^p l(\theta | X_i, Y_i, \beta_i, Z_i, \mu_{X_i}) \\
+    & = \sum_{i=1}^p \Big\{ \text{log} \phi(\mu_{X_i}; m_x, \lambda_x^2) + \sum_{k=1}^K Z_{ik} \big[\text{log} \pi_k + \text{log} \phi(\beta_i; \mu_k, \sigma_k^2) \big] \Big\}
+\end{align*}
+$$
+where $Z_{ik} = 1$ if $Z_i = k$ and $Z_{ik} = 0$ otherwise. 
+
+To approximate the E-step expectation, we approximate $E(\mu_{X_i} | X_i, Y_i, \theta)$, $E(\mu_{X_i}^2 | X_i, Y_i, \theta)$, $E(Z_{ik} \beta_i | X_i, Y_i, \theta)$, $E(Z_{ik} \beta_i^2 | X_i, Y_i, \theta)$, and $E(Z_{ik} | X_i, Y_i, \theta)$ using the importance sampling procedure described in the previous section. After obtaining the importance sampling estimates, the M step is straightforward so we omit the details here.  
+
+# Software
+
+Code to replicate the results in this analysis are available at https://github.com/danieliong/MRDataChallenge2019. An implementation of the Monte-Carlo EM algorithm is available at https://github.com/danieliong/MR-MCEM. 
+
+
+# References 
+
+
+
